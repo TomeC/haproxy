@@ -76,6 +76,7 @@
 #define H1S_F_WANT_CLO       0x00000040
 #define H1S_F_WANT_MSK       0x00000070
 #define H1S_F_NOT_FIRST      0x00000080 /* The H1 stream is not the first one */
+#define H1S_F_BODYLESS_RESP  0x00000100 /* Bodyless response message */
 
 /* 0x00000200 unsued */
 #define H1S_F_NOT_IMPL_ERROR 0x00000400 /* Set when a feature is not implemented during the message parsing */
@@ -1323,11 +1324,15 @@ static size_t h1_process_headers(struct h1s *h1s, struct h1m *h1m, struct htx *h
 		h1s->meth = h1sl.rq.meth;
 		if (h1m->state == H1_MSG_TUNNEL)
 			h1_set_req_tunnel_mode(h1s);
+		if (h1s->meth == HTTP_METH_HEAD)
+			h1s->flags |= H1S_F_BODYLESS_RESP;
 	}
 	else {
 		h1s->status = h1sl.st.status;
 		if (h1m->state == H1_MSG_TUNNEL)
 			h1_set_res_tunnel_mode(h1s);
+		if (h1s->status == 204 || h1s->status == 304)
+			h1s->flags |= H1S_F_BODYLESS_RESP;
 	}
 	h1_process_input_conn_mode(h1s, h1m, htx);
 	*ofs += ret;
@@ -1732,6 +1737,8 @@ static size_t h1_process_output(struct h1c *h1c, struct buffer *buf, size_t coun
 				if (sl->flags & HTX_SL_F_BODYLESS)
 					h1m->flags |= H1_MF_CLEN;
 				h1m->state = H1_MSG_HDR_FIRST;
+				if (h1s->meth == HTTP_METH_HEAD)
+					h1s->flags |= H1S_F_BODYLESS_RESP;
 				if (h1c->flags & H1C_F_WAIT_OPPOSITE) {
 					h1c->flags &= ~H1C_F_WAIT_OPPOSITE;
 					h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
@@ -1750,9 +1757,10 @@ static size_t h1_process_output(struct h1c *h1c, struct buffer *buf, size_t coun
 					goto full;
 				if (sl->flags & HTX_SL_F_XFER_LEN)
 					h1m->flags |= H1_MF_XFER_LEN;
-				if (sl->info.res.status < 200 &&
-				    (sl->info.res.status == 100 || sl->info.res.status >= 102))
+				if (h1s->status < 200 && (h1s->status == 100 || h1s->status >= 102))
 					h1s->flags |= H1S_F_HAVE_O_CONN;
+				else if (h1s->status == 204 || h1s->status == 304)
+					h1s->flags |= H1S_F_BODYLESS_RESP;
 				h1m->state = H1_MSG_HDR_FIRST;
 				break;
 
