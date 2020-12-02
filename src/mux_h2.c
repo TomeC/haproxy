@@ -4663,12 +4663,8 @@ next_frame:
 		*flags |= H2_SF_HEADERS_RCVD;
 
 	if ((h2c->dff & H2_F_HEADERS_END_STREAM)) {
-		/* Mark the end of message using EOM */
-		htx->flags |= HTX_FL_EOM; /* no more data are expected. Only EOM remains to add now */
-		if (!htx_add_endof(htx, HTX_BLK_EOM)) {
-			TRACE_STATE("failed to append HTX EOM block into rxbuf", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2S_ERR, h2c->conn);
-			goto fail;
-		}
+		 /* no more data are expected for this message */
+		htx->flags |= HTX_FL_EOM;
 	}
 
 	/* success */
@@ -4801,12 +4797,9 @@ try_again:
 	 */
 
 	if (h2c->dff & H2_F_DATA_END_STREAM) {
-		htx->flags |= HTX_FL_EOM; /* no more data are expected. Only EOM remains to add now */
-		if (!htx_add_endof(htx, HTX_BLK_EOM)) {
-			TRACE_STATE("h2s rxbuf is full, failed to add EOM", H2_EV_RX_FRAME|H2_EV_RX_DATA|H2_EV_H2S_BLK, h2c->conn, h2s);
-			h2c->flags |= H2_CF_DEM_SFULL;
-			goto fail;
-		}
+		/* no more data are expected for this message */
+		/* FIXME: Don't set it on the last tunneled data (not handled for now) */
+		htx->flags |= HTX_FL_EOM;
 	}
 
 	h2c->rcvd_c += h2c->dpl;
@@ -4837,7 +4830,6 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 	struct http_hdr list[global.tune.max_http_hdr];
 	struct h2c *h2c = h2s->h2c;
 	struct htx_blk *blk;
-	struct htx_blk *blk_end;
 	struct buffer outbuf;
 	struct buffer *mbuf;
 	struct htx_sl *sl;
@@ -4845,7 +4837,6 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 	int es_now = 0;
 	int ret = 0;
 	int hdr;
-	int idx;
 
 	TRACE_ENTER(H2_EV_TX_FRAME|H2_EV_TX_HDR, h2c->conn, h2s);
 
@@ -4856,63 +4847,53 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 		return 0;
 	}
 
-	/* determine the first block which must not be deleted, blk_end may
-	 * be NULL if all blocks have to be deleted.
-	 */
-	idx = htx_get_head(htx);
-	blk_end = NULL;
-	while (idx != -1) {
-		type = htx_get_blk_type(htx_get_blk(htx, idx));
-		idx = htx_get_next(htx, idx);
-		if (type == HTX_BLK_EOH) {
-			if (idx != -1)
-				blk_end = htx_get_blk(htx, idx);
-			break;
-		}
-	}
-
-	/* get the start line, we do have one */
-	blk = htx_get_head_blk(htx);
-	BUG_ON(!blk || htx_get_blk_type(blk) != HTX_BLK_RES_SL);
-	ALREADY_CHECKED(blk);
-	sl = htx_get_blk_ptr(htx, blk);
-	h2s->status = sl->info.res.status;
-	if (h2s->status < 100 || h2s->status > 999) {
-		TRACE_ERROR("will not encode an invalid status code", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
-		goto fail;
-	}
-
-	/* and the rest of the headers, that we dump starting at header 0 */
+	/* get the start line (we do have one) and the rest of the headers,
+	 * that we dump starting at header 0 */
+	sl = NULL;
 	hdr = 0;
-
-	idx = htx_get_head(htx); // returns the SL that we skip
-	while ((idx = htx_get_next(htx, idx)) != -1) {
-		blk = htx_get_blk(htx, idx);
+	for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
 		type = htx_get_blk_type(blk);
 
 		if (type == HTX_BLK_UNUSED)
 			continue;
 
-		if (type != HTX_BLK_HDR)
+		if (type == HTX_BLK_EOH)
 			break;
 
-		if (unlikely(hdr >= sizeof(list)/sizeof(list[0]) - 1)) {
-			TRACE_ERROR("too many headers", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+		if (type == HTX_BLK_RES_SL) {
+			if (sl) {
+				TRACE_PROTO("multiple start-lines", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
+			sl = htx_get_blk_ptr(htx, blk);
+			h2s->status = sl->info.res.status;
+			if (h2s->status < 100 || h2s->status > 999) {
+				TRACE_ERROR("will not encode an invalid status code", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
+		}
+		else if (type == HTX_BLK_HDR) {
+			if (!sl) {
+				TRACE_ERROR("no start-lines", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
+			if (unlikely(hdr >= sizeof(list)/sizeof(list[0]) - 1)) {
+				TRACE_ERROR("too many headers", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
+
+			list[hdr].n = htx_get_blk_name(htx, blk);
+			list[hdr].v = htx_get_blk_value(htx, blk);
+			hdr++;
+		}
+		else {
+			TRACE_ERROR("will not encode unexpected htx block", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
 			goto fail;
 		}
-
-		list[hdr].n = htx_get_blk_name(htx, blk);
-		list[hdr].v = htx_get_blk_value(htx, blk);
-		hdr++;
 	}
 
 	/* marker for end of headers */
 	list[hdr].n = ist("");
-
-	if (h2s->status == 204 || h2s->status == 304) {
-		/* no contents, claim c-len is present and set to zero */
-		es_now = 1;
-	}
 
 	mbuf = br_tail(h2c->mbuf);
  retry:
@@ -4985,20 +4966,35 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 		}
 	}
 
-	/* we may need to add END_STREAM except for 1xx responses.
-	 * FIXME: we should also set it when we know for sure that the
-	 * content-length is zero as well as on 204/304
+	/* remove all header blocks including the EOH and compute the
+	 * corresponding size.
 	 */
-	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM && h2s->status >= 200) {
-		/* we may need to add END_STREAM except for 1xx responses and
-		 * 2xx responses to a connect
+	ret = 0;
+	blk = htx_get_head_blk(htx);
+	while (blk) {
+		type = htx_get_blk_type(blk);
+		ret += htx_get_blksz(blk);
+		blk = htx_remove_blk(htx, blk);
+		/* The removed block is the EOH */
+		if (type == HTX_BLK_EOH)
+			break;
+	}
+
+	if (!h2s->cs || h2s->cs->flags & CS_FL_SHW) {
+		/* Response already closed: add END_STREAM */
+		es_now = 1;
+	}
+	else if (h2s->status == 204 || h2s->status == 304) {
+		/* no contents, claim c-len is present and set to zero */
+		es_now = 1;
+	}
+	else if ((htx->flags & HTX_FL_EOM) && htx_is_empty(htx) && h2s->status >= 200) {
+		/* EOM+empty: we may need to add END_STREAM except for 1xx
+		 * responses and 2xx responses to a connect.
 		 */
 		if (!(h2s->flags & H2_SF_BODY_TUNNEL) || h2s->status >= 300)
 			es_now = 1;
 	}
-
-	if (!h2s->cs || h2s->cs->flags & CS_FL_SHW)
-		es_now = 1;
 
 	if (es_now)
 		outbuf.area[4] |= H2_F_HEADERS_END_STREAM;
@@ -5023,24 +5019,6 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 	}
 
 	/* OK we could properly deliver the response */
-
-	/* remove all header blocks including the EOH and compute the
-	 * corresponding size.
-	 *
-	 * FIXME: We should remove everything when es_now is set.
-	 */
-	ret = 0;
-	idx = htx_get_head(htx);
-	blk = htx_get_blk(htx, idx);
-	while (blk != blk_end) {
-		ret += htx_get_blksz(blk);
-		blk = htx_remove_blk(htx, blk);
-	}
-
-	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM) {
-		ret += htx_get_blksz(blk_end);
-		htx_remove_blk(htx, blk_end);
-	}
  end:
 	TRACE_LEAVE(H2_EV_TX_FRAME|H2_EV_TX_HDR, h2c->conn, h2s);
 	return ret;
@@ -5075,7 +5053,6 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 	struct http_hdr list[global.tune.max_http_hdr];
 	struct h2c *h2c = h2s->h2c;
 	struct htx_blk *blk;
-	struct htx_blk *blk_end;
 	struct buffer outbuf;
 	struct buffer *mbuf;
 	struct htx_sl *sl;
@@ -5084,7 +5061,6 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 	int es_now = 0;
 	int ret = 0;
 	int hdr;
-	int idx;
 
 	TRACE_ENTER(H2_EV_TX_FRAME|H2_EV_TX_HDR, h2c->conn, h2s);
 
@@ -5095,61 +5071,56 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 		return 0;
 	}
 
-	/* determine the first block which must not be deleted, blk_end may
-	 * be NULL if all blocks have to be deleted.
-	 */
-	idx = htx_get_head(htx);
-	blk_end = NULL;
-	while (idx != -1) {
-		type = htx_get_blk_type(htx_get_blk(htx, idx));
-		idx = htx_get_next(htx, idx);
-		if (type == HTX_BLK_EOH) {
-			if (idx != -1)
-				blk_end = htx_get_blk(htx, idx);
-			break;
-		}
-	}
-
-	/* get the start line, we do have one */
-	blk = htx_get_head_blk(htx);
-	BUG_ON(!blk || htx_get_blk_type(blk) != HTX_BLK_REQ_SL);
-	ALREADY_CHECKED(blk);
-	sl = htx_get_blk_ptr(htx, blk);
-	meth = htx_sl_req_meth(sl);
-	uri  = htx_sl_req_uri(sl);
-	if (unlikely(uri.len == 0)) {
-		TRACE_ERROR("no URI in HTX request", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
-		goto fail;
-	}
-
-	/* and the rest of the headers, that we dump starting at header 0 */
+	/* get the start line (we do have one) and the rest of the headers,
+	 * that we dump starting at header 0 */
+	sl = NULL;
 	hdr = 0;
-
-	idx = htx_get_head(htx); // returns the SL that we skip
-	while ((idx = htx_get_next(htx, idx)) != -1) {
-		blk = htx_get_blk(htx, idx);
+	for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
 		type = htx_get_blk_type(blk);
 
 		if (type == HTX_BLK_UNUSED)
 			continue;
 
-		if (type != HTX_BLK_HDR)
+		if (type == HTX_BLK_EOH)
 			break;
 
-		if (unlikely(hdr >= sizeof(list)/sizeof(list[0]) - 1)) {
-			TRACE_ERROR("too many headers", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+		if (type == HTX_BLK_REQ_SL) {
+			if (sl) {
+				TRACE_ERROR("multiple start-lines", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
+			sl = htx_get_blk_ptr(htx, blk);
+			meth = htx_sl_req_meth(sl);
+			uri  = htx_sl_req_uri(sl);
+			if (unlikely(uri.len == 0)) {
+				TRACE_ERROR("no URI in HTX request", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
+		}
+		else if (type == HTX_BLK_HDR) {
+			if (!sl) {
+				TRACE_ERROR("no start-lines", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
+			if (unlikely(hdr >= sizeof(list)/sizeof(list[0]) - 1)) {
+				TRACE_ERROR("too many headers", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
+
+			list[hdr].n = htx_get_blk_name(htx, blk);
+			list[hdr].v = htx_get_blk_value(htx, blk);
+
+			/* Skip header if same name is used to add the server name */
+			if ((h2c->flags & H2_CF_IS_BACK) && h2c->proxy->server_id_hdr_name &&
+			    isteq(list[hdr].n, ist2(h2c->proxy->server_id_hdr_name, h2c->proxy->server_id_hdr_len)))
+				continue;
+
+			hdr++;
+		}
+		else {
+			TRACE_ERROR("will not encode unexpected htx block", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
 			goto fail;
 		}
-
-		list[hdr].n = htx_get_blk_name(htx, blk);
-		list[hdr].v = htx_get_blk_value(htx, blk);
-
-		/* Skip header if same name is used to add the server name */
-		if ((h2c->flags & H2_CF_IS_BACK) && h2c->proxy->server_id_hdr_name &&
-		    isteq(list[hdr].n, ist2(h2c->proxy->server_id_hdr_name, h2c->proxy->server_id_hdr_len)))
-			continue;
-
-		hdr++;
 	}
 
 	/* Now add the server name to a header (if requested) */
@@ -5348,22 +5319,32 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 		}
 	}
 
-	/* we may need to add END_STREAM if we have no body :
-	 *  - request already closed, or :
-	 *  - no transfer-encoding, and :
-	 *  - no content-length or content-length:0
+
+	/* remove all header blocks including the EOH and compute the
+	 * corresponding size.
 	 */
-	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM) {
-		/* we may need to add END_STREAM (except for CONNECT request) */
+	ret = 0;
+	blk = htx_get_head_blk(htx);
+	while (blk) {
+		type = htx_get_blk_type(blk);
+		ret += htx_get_blksz(blk);
+		blk = htx_remove_blk(htx, blk);
+		/* The removed block is the EOH */
+		if (type == HTX_BLK_EOH)
+			break;
+	}
+
+	if (!h2s->cs || h2s->cs->flags & CS_FL_SHW) {
+		/* Request already closed: add END_STREAM */
+		es_now = 1;
+	}
+	else if ((htx->flags & HTX_FL_EOM) && htx_is_empty(htx)) {
+		/* EOM+empty: we may need to add END_STREAM (except for CONNECT
+		 * request)
+		 */
 		if (!(h2s->flags & H2_SF_BODY_TUNNEL))
 			es_now = 1;
 	}
-
-	if (sl->flags & HTX_SL_F_BODYLESS)
-		es_now = 1;
-
-	if (!h2s->cs || h2s->cs->flags & CS_FL_SHW)
-		es_now = 1;
 
 	if (es_now)
 		outbuf.area[4] |= H2_F_HEADERS_END_STREAM;
@@ -5379,24 +5360,6 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 		// trim any possibly pending data (eg: inconsistent content-length)
 		h2s->flags |= H2_SF_ES_SENT;
 		h2s->st = H2_SS_HLOC;
-	}
-
-	/* remove all header blocks including the EOH and compute the
-	 * corresponding size.
-	 *
-	 * FIXME: We should remove everything when es_now is set.
-	 */
-	ret = 0;
-	idx = htx_get_head(htx);
-	blk = htx_get_blk(htx, idx);
-	while (blk != blk_end) {
-		ret += htx_get_blksz(blk);
-		blk = htx_remove_blk(htx, blk);
-	}
-
-	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM) {
-		ret += htx_get_blksz(blk_end);
-		htx_remove_blk(htx, blk_end);
 	}
 
  end:
@@ -5422,7 +5385,7 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
  * present in <buf>, for stream <h2s>. Returns the number of bytes sent. The
  * caller must check the stream's status to detect any error which might have
  * happened subsequently to a successful send. Returns the number of data bytes
- * consumed, or zero if nothing done. Note that EOM count for 1 byte.
+ * consumed, or zero if nothing done.
  */
 static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 {
@@ -5436,7 +5399,6 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 	int fsize; /* h2 frame size  */
 	struct htx_blk *blk;
 	enum htx_blk_type type;
-	int idx;
 	int trunc_out; /* non-zero if truncated on out buf */
 
 	TRACE_ENTER(H2_EV_TX_FRAME|H2_EV_TX_DATA, h2c->conn, h2s);
@@ -5450,32 +5412,18 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 
 	htx = htx_from_buf(buf);
 
-	/* We only come here with HTX_BLK_DATA blocks. However, while looping,
-	 * we can meet an HTX_BLK_EOM block that we'll leave to the caller to
-	 * handle.
-	 */
+	/* We only come here with HTX_BLK_DATA blocks */
 
  new_frame:
 	if (!count || htx_is_empty(htx))
 		goto end;
 
-	idx   = htx_get_head(htx);
-	blk   = htx_get_blk(htx, idx);
-	type  = htx_get_blk_type(blk); // DATA or EOM
+	blk   = htx_get_head_blk(htx);
+	type  = htx_get_blk_type(blk);
 	bsize = htx_get_blksz(blk);
 	fsize = bsize;
 	trunc_out = 0;
-
-	if (type == HTX_BLK_EOM) {
-		if (h2s->flags & H2_SF_ES_SENT) {
-			/* ES already sent */
-			htx_remove_blk(htx, blk);
-			total++; // EOM counts as one byte
-			count--;
-			goto end;
-		}
-	}
-	else if (type != HTX_BLK_DATA)
+	if (type != HTX_BLK_DATA)
 		goto end;
 
 	mbuf = br_tail(h2c->mbuf);
@@ -5590,12 +5538,6 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 	 * unblocked on window opening. Note: we don't implement padding.
 	 */
 
-	/* EOM is presented with bsize==1 but would lead to the emission of an
-	 * empty frame, thus we force it to zero here.
-	 */
-	if (type == HTX_BLK_EOM)
-		bsize = fsize = 0;
-
 	if (!fsize)
 		goto send_empty;
 
@@ -5659,13 +5601,18 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 	/* update the frame's size */
 	h2_set_frame_size(outbuf.area, fsize);
 
-	/* FIXME: for now we only set the ES flag on empty DATA frames, once
-	 * meeting EOM. We should optimize this later.
-	 */
-	if (type == HTX_BLK_EOM) {
-		total++; // EOM counts as one byte
-		count--;
-		es_now = 1;
+	/* consume incoming HTX block */
+	total += fsize;
+	if (fsize == bsize) {
+		htx_remove_blk(htx, blk);
+		if ((htx->flags & HTX_FL_EOM) && htx_is_empty(htx)) {
+			/* EOM+empty: we may need to add END_STREAM */
+			es_now = 1;
+		}
+	}
+	else {
+		/* we've truncated this block */
+		htx_cut_data_blk(htx, blk, fsize);
 	}
 
 	if (es_now)
@@ -5674,19 +5621,15 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 	/* commit the H2 response */
 	b_add(mbuf, fsize + 9);
 
-	/* consume incoming HTX block, including EOM */
-	total += fsize;
-	if (fsize == bsize) {
-		htx_remove_blk(htx, blk);
-		if (fsize) {
-			TRACE_DEVEL("more data available, trying to send another frame", H2_EV_TX_FRAME|H2_EV_TX_DATA, h2c->conn, h2s);
+	if (fsize) {
+		if (fsize == bsize) {
+			TRACE_DEVEL("more data may be available, trying to send another frame", H2_EV_TX_FRAME|H2_EV_TX_DATA, h2c->conn, h2s);
 			goto new_frame;
 		}
-	} else {
-		/* we've truncated this block */
-		htx_cut_data_blk(htx, blk, fsize);
-		if (trunc_out)
+		else if (trunc_out) {
+			/* we've truncated this block */
 			goto new_frame;
+		}
 	}
 
 	if (es_now) {
@@ -5710,15 +5653,14 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
  * which might have happened subsequently to a successful send. The htx blocks
  * are automatically removed from the message. The htx message is assumed to be
  * valid since produced from the internal code. Processing stops when meeting
- * the EOM, which is *not* removed. All trailers are processed at once and sent
- * as a single frame. The ES flag is always set.
+ * the EOT, which *is* removed. All trailers are processed at once and sent as a
+ * single frame. The ES flag is always set.
  */
 static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
 {
 	struct http_hdr list[global.tune.max_http_hdr];
 	struct h2c *h2c = h2s->h2c;
 	struct htx_blk *blk;
-	struct htx_blk *blk_end;
 	struct buffer outbuf;
 	struct buffer *mbuf;
 	enum htx_blk_type type;
@@ -5735,36 +5677,30 @@ static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
 		goto end;
 	}
 
-	/* determine the first block which must not be deleted, blk_end may
-	 * be NULL if all blocks have to be deleted. also get trailers.
-         */
-	idx = htx_get_head(htx);
-	blk_end = NULL;
-
+	/* get trailers. */
 	hdr = 0;
-	while (idx != -1) {
-		blk = htx_get_blk(htx, idx);
+	for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
 		type = htx_get_blk_type(blk);
-		idx = htx_get_next(htx, idx);
+
 		if (type == HTX_BLK_UNUSED)
 			continue;
 
-		if (type == HTX_BLK_EOT) {
-			if (idx != -1)
-				blk_end = blk;
+		if (type == HTX_BLK_EOT)
 			break;
-		}
-		if (type != HTX_BLK_TLR)
-			break;
+		if (type == HTX_BLK_TLR) {
+			if (unlikely(hdr >= sizeof(list)/sizeof(list[0]) - 1)) {
+				TRACE_ERROR("too many headers", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+				goto fail;
+			}
 
-		if (unlikely(hdr >= sizeof(list)/sizeof(list[0]) - 1)) {
-			TRACE_ERROR("too many trailers", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
+			list[hdr].n = htx_get_blk_name(htx, blk);
+			list[hdr].v = htx_get_blk_value(htx, blk);
+			hdr++;
+		}
+		else {
+			TRACE_ERROR("will not encode unexpected htx block", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
 			goto fail;
 		}
-
-		list[hdr].n = htx_get_blk_name(htx, blk);
-		list[hdr].v = htx_get_blk_value(htx, blk);
-		hdr++;
 	}
 
 	/* marker for end of trailers */
@@ -5861,16 +5797,14 @@ static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
  done:
 	/* remove all header blocks till the end and compute the corresponding size. */
 	ret = 0;
-	idx = htx_get_head(htx);
-	blk = htx_get_blk(htx, idx);
-	while (blk != blk_end) {
+	blk = htx_get_head_blk(htx);
+	while (blk) {
+		type = htx_get_blk_type(blk);
 		ret += htx_get_blksz(blk);
 		blk = htx_remove_blk(htx, blk);
-	}
-
-	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM) {
-		ret += htx_get_blksz(blk_end);
-		htx_remove_blk(htx, blk_end);
+		/* The removed block is the EOT */
+		if (type == HTX_BLK_EOT)
+			break;
 	}
 
  end:
@@ -5993,7 +5927,7 @@ static size_t h2_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 		goto end;
 	}
 
-	htx_xfer_blks(buf_htx, h2s_htx, count, HTX_BLK_EOM);
+	htx_xfer_blks(buf_htx, h2s_htx, count, HTX_BLK_UNUSED);
 
 	if (h2s_htx->flags & HTX_FL_PARSING_ERROR) {
 		buf_htx->flags |= HTX_FL_PARSING_ERROR;
@@ -6127,11 +6061,7 @@ static size_t h2_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 				break;
 
 			case HTX_BLK_DATA:
-			case HTX_BLK_EOM:
-				/* all these cause the emission of a DATA frame (possibly empty).
-				 * This EOM necessarily is one before trailers, as the EOM following
-				 * trailers would have been consumed by the trailers parser.
-				 */
+				/* all these cause the emission of a DATA frame (possibly empty) */
 				ret = h2s_make_data(h2s, buf, count);
 				if (ret > 0) {
 					htx = htx_from_buf(buf);
@@ -6144,9 +6074,7 @@ static size_t h2_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 
 			case HTX_BLK_TLR:
 			case HTX_BLK_EOT:
-				/* This is the first trailers block, all the subsequent ones AND
-				 * the EOM will be swallowed by the parser.
-				 */
+				/* This is the first trailers block, all the subsequent ones */
 				ret = h2s_make_trailers(h2s, htx);
 				if (ret > 0) {
 					total += ret;

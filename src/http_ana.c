@@ -755,8 +755,7 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 	 * in case we previously disabled it, otherwise we might cause
 	 * the client to delay further data.
 	 */
-	if ((sess->listener->options & LI_O_NOQUICKACK) &&
-	    (htx_get_tail_type(htx) != HTX_BLK_EOM))
+	if ((sess->listener->options & LI_O_NOQUICKACK) && !(htx->flags & HTX_FL_EOM))
 		conn_set_quickack(cli_conn, 1);
 
 	/*************************************************************
@@ -895,7 +894,7 @@ int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit
 	/* Now we're in HTTP_MSG_DATA. We just need to know if all data have
 	 * been received or if the buffer is full.
 	 */
-	if (htx_get_tail_type(htx) > HTX_BLK_DATA ||
+	if ((htx->flags & HTX_FL_EOM) || htx_get_tail_type(htx) > HTX_BLK_DATA ||
 	    channel_htx_full(req, htx, global.tune.maxrewrite))
 		goto http_end;
 
@@ -1053,6 +1052,10 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	 * let them decide the amount of data to forward.
 	 */
 	if (HAS_REQ_DATA_FILTERS(s)) {
+		if (msg->flags & HTTP_MSGF_BODYLESS) {
+			msg->msg_state = HTTP_MSG_ENDING;
+			goto ending;
+		}
 		ret  = flt_http_payload(s, msg, htx->data);
 		if (ret < 0)
 			goto return_bad_req;
@@ -1071,7 +1074,7 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	 * in HTTP_MSG_ENDING state. Then if all data was marked to be
 	 * forwarded, set the state to HTTP_MSG_DONE.
 	 */
-	if (htx_get_tail_type(htx) != HTX_BLK_EOM)
+	if (!(htx->flags & HTX_FL_EOM))
 		goto missing_data_or_waiting;
 
 	msg->msg_state = HTTP_MSG_ENDING;
@@ -2143,6 +2146,10 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	 * let them decide the amount of data to forward.
 	 */
 	if (HAS_RSP_DATA_FILTERS(s)) {
+		if (msg->flags & HTTP_MSGF_BODYLESS) {
+			msg->msg_state = HTTP_MSG_ENDING;
+			goto ending;
+		}
 		ret  = flt_http_payload(s, msg, htx->data);
 		if (ret < 0)
 			goto return_bad_res;
@@ -2166,7 +2173,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	 * in HTTP_MSG_ENDING state. Then if all data was marked to be
 	 * forwarded, set the state to HTTP_MSG_DONE.
 	 */
-	if (htx_get_tail_type(htx) != HTX_BLK_EOM)
+	if (!(htx->flags & HTX_FL_EOM))
 		goto missing_data_or_waiting;
 
 	msg->msg_state = HTTP_MSG_ENDING;
@@ -2522,9 +2529,10 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 			goto fail;
 	}
 
-	if (!htx_add_endof(htx, HTX_BLK_EOH) || !htx_add_endof(htx, HTX_BLK_EOM))
+	if (!htx_add_endof(htx, HTX_BLK_EOH))
 		goto fail;
 
+	htx->flags |= HTX_FL_EOM;
 	htx_to_buf(htx, &res->buf);
 	if (!http_forward_proxy_resp(s, 1))
 		goto fail;
@@ -4067,9 +4075,10 @@ void http_perform_server_redirect(struct stream *s, struct stream_interface *si)
 	    !htx_add_header(htx, ist("Location"), location))
 		goto fail;
 
-	if (!htx_add_endof(htx, HTX_BLK_EOH) || !htx_add_endof(htx, HTX_BLK_EOM))
+	if (!htx_add_endof(htx, HTX_BLK_EOH))
 		goto fail;
 
+	htx->flags |= HTX_FL_EOM;
 	htx_to_buf(htx, &res->buf);
 	if (!http_forward_proxy_resp(s, 1))
 		goto fail;
@@ -4554,9 +4563,10 @@ int http_reply_to_htx(struct stream *s, struct htx *htx, struct http_reply *repl
 		if (!htx_add_header(htx, ist("content-length"), ist(clen)) ||
 		    (body && b_data(body) && ctype && !htx_add_header(htx, ist("content-type"), ist(ctype))) ||
 		    !htx_add_endof(htx, HTX_BLK_EOH) ||
-		    (body && b_data(body) && !htx_add_data_atonce(htx, ist2(b_head(body), b_data(body)))) ||
-		    !htx_add_endof(htx, HTX_BLK_EOM))
+		    (body && b_data(body) && !htx_add_data_atonce(htx, ist2(b_head(body), b_data(body)))))
 			goto fail;
+
+		htx->flags |= HTX_FL_EOM;
 	}
 
   leave:
