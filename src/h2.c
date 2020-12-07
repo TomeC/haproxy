@@ -445,6 +445,9 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 			goto fail;
 	}
 
+	if (*msgf & H2_MSGF_BODY_TUNNEL)
+		*msgf &= ~(H2_MSGF_BODY|H2_MSGF_BODY_CL);
+
 	if (!(*msgf & H2_MSGF_BODY) || ((*msgf & H2_MSGF_BODY_CL) && *body_len == 0))
 		sl_flags |= HTX_SL_F_BODYLESS;
 
@@ -682,6 +685,9 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 		if (!sl)
 			goto fail;
 	}
+
+	if ((*msgf & H2_MSGF_BODY_TUNNEL) && sl->info.res.status >= 200 && sl->info.res.status < 300)
+		*msgf &= ~(H2_MSGF_BODY|H2_MSGF_BODY_CL);
 
 	if (!(*msgf & H2_MSGF_BODY) || ((*msgf & H2_MSGF_BODY_CL) && *body_len == 0))
 		sl_flags |= HTX_SL_F_BODYLESS;

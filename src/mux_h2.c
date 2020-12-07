@@ -177,7 +177,8 @@ enum h2_ss {
 
 /* stream flags indicating how data is supposed to be sent */
 #define H2_SF_DATA_CLEN         0x00000100 // data sent using content-length
-/* unused flags: 0x00000200, 0x00000400 */
+/* unused flags: 0x00000200 */
+#define H2_SF_BODY_TUNNEL       0x00000400 // Attempt to establish a Tunnelled stream (the result depends on the status code)
 
 #define H2_SF_NOTIFIED          0x00000800  // a paused stream was notified to try to send again
 #define H2_SF_HEADERS_SENT      0x00001000  // a HEADERS frame was sent for this stream
@@ -2843,6 +2844,13 @@ static int h2c_handle_data(struct h2c *h2c, struct h2s *h2s)
 		HA_ATOMIC_ADD(&h2c->px_counters->strm_proto_err, 1);
 		goto strm_err;
 	}
+	else if (!(h2c->flags & H2_CF_IS_BACK) && (h2c->dfl - h2c->dpl) > 0 &&
+		 (h2s->flags & H2_SF_BODY_TUNNEL) && (h2s->status < 200 || h2s->status >= 300)) {
+		TRACE_ERROR("non-empty DATA frame unexpected on a non-fully established tunnel", H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
+		error = H2_ERR_PROTOCOL_ERROR;
+		HA_ATOMIC_ADD(&h2c->px_counters->strm_proto_err, 1);
+		goto strm_err;
+	}
 
 	if (!h2_frt_transfer_data(h2s))
 		goto fail;
@@ -4618,6 +4626,7 @@ next_frame:
 
 	/* OK now we have our header list in <list> */
 	msgf = (h2c->dff & H2_F_HEADERS_END_STREAM) ? 0 : H2_MSGF_BODY;
+	msgf |= (*flags & H2_SF_BODY_TUNNEL) ? H2_MSGF_BODY_TUNNEL: 0;
 
 	if (*flags & H2_SF_HEADERS_RCVD)
 		goto trailers;
@@ -4641,6 +4650,9 @@ next_frame:
 			htx->extra = *body_len;
 		}
 	}
+
+	if (msgf & H2_MSGF_BODY_TUNNEL)
+		*flags |= H2_SF_BODY_TUNNEL;
 
  done:
 	/* indicate that a HEADERS frame was received for this stream, except
@@ -4977,8 +4989,13 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 	 * FIXME: we should also set it when we know for sure that the
 	 * content-length is zero as well as on 204/304
 	 */
-	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM && h2s->status >= 200)
-		es_now = 1;
+	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM && h2s->status >= 200) {
+		/* we may need to add END_STREAM except for 1xx responses and
+		 * 2xx responses to a connect
+		 */
+		if (!(h2s->flags & H2_SF_BODY_TUNNEL) || h2s->status >= 300)
+			es_now = 1;
+	}
 
 	if (!h2s->cs || h2s->cs->flags & CS_FL_SHW)
 		es_now = 1;
@@ -5199,6 +5216,7 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 				goto realign_again;
 			goto full;
 		}
+		h2s->flags |= H2_SF_BODY_TUNNEL;
 	} else {
 		/* other methods need a :scheme. If an authority is known from
 		 * the request line, it must be sent, otherwise only host is
@@ -5334,10 +5352,12 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 	 *  - request already closed, or :
 	 *  - no transfer-encoding, and :
 	 *  - no content-length or content-length:0
-	 * Fixme: this doesn't take into account CONNECT requests.
 	 */
-	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM)
-		es_now = 1;
+	if (blk_end && htx_get_blk_type(blk_end) == HTX_BLK_EOM) {
+		/* we may need to add END_STREAM (except for CONNECT request) */
+		if (!(h2s->flags & H2_SF_BODY_TUNNEL))
+			es_now = 1;
+	}
 
 	if (sl->flags & HTX_SL_F_BODYLESS)
 		es_now = 1;
