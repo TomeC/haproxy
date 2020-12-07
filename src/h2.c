@@ -544,13 +544,14 @@ static struct htx_sl *h2_prepare_htx_stsline(uint32_t fields, struct ist *phdr, 
 
 	sl->info.res.status = h * 100 + t * 10 + u;
 
-	/* On 1xx responses (except 101) there is no ES on the HEADERS frame but
-	 * there is no body. So remove the flag H2_MSGF_BODY and add
-	 * H2_MSGF_RSP_1XX to notify the decoder another HEADERS frame is
-	 * expected.
+	/* 101 responses are not supported in H2, so return a error.
+	 * On 1xx responses there is no ES on the HEADERS frame but there is no
+	 * body. So remove the flag H2_MSGF_BODY and add H2_MSGF_RSP_1XX to
+	 * notify the decoder another HEADERS frame is expected.
 	 */
-	if (sl->info.res.status < 200 &&
-	    (sl->info.res.status == 100 || sl->info.res.status >= 102)) {
+	if (sl->info.res.status == 101)
+		goto fail;
+	else if (sl->info.res.status < 200) {
 		*msgf |= H2_MSGF_RSP_1XX;
 		*msgf &= ~H2_MSGF_BODY;
 	}
