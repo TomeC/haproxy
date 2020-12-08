@@ -1352,9 +1352,17 @@ static size_t h1_process_data(struct h1s *h1s, struct h1m *h1m, struct htx **htx
 			      struct buffer *buf, size_t *ofs, size_t max,
 			      struct buffer *htxbuf)
 {
-	int ret;
+	int ret = 0;
 
 	TRACE_ENTER(H1_EV_RX_DATA|H1_EV_RX_BODY, h1s->h1c->conn, h1s, 0, (size_t[]){max});
+
+	if ((b_data(buf) > *ofs) && (h1s->h1c->flags & H1C_F_WAIT_OPPOSITE)) {
+		h1s->flags |= H1S_F_PARSING_ERROR;
+		TRACE_PROTO("waiting for sync, reject H1 message", H1_EV_RX_DATA|H1_EV_RX_EOI|H1_EV_H1S_ERR, h1s->h1c->conn, h1s);
+		h1_capture_bad_message(h1s->h1c, h1s, h1m, buf);
+		goto end;
+	}
+
 	ret = h1_parse_msg_data(h1m, htx, buf, *ofs, max, htxbuf);
 	if (!ret) {
 		TRACE_DEVEL("leaving on missing data or error", H1_EV_RX_DATA|H1_EV_RX_BODY, h1s->h1c->conn, h1s);
