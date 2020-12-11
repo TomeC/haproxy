@@ -191,6 +191,7 @@ enum h2_ss {
 #define H2_SF_KILL_CONN         0x00020000  // kill the whole connection with this stream
 
 #define H2_SF_EXT_CONNECT_SENT  0x00040000  // rfc 8441 an Extended CONNECT has been sent
+#define H2_SF_EXT_CONNECT_RCVD  0x00080000  // rfc 8441 an Extended CONNECT has been received and parsed
 
 /* H2 stream descriptor, describing the stream as it appears in the H2C, and as
  * it is being processed in the internal HTTP representation (HTX).
@@ -4676,6 +4677,9 @@ next_frame:
 		htx->flags |= HTX_FL_EOM;
 	}
 
+	if (msgf & H2_MSGF_EXT_CONNECT)
+		*flags |= H2_SF_EXT_CONNECT_RCVD;
+
 	/* success */
 	ret = 1;
 
@@ -4881,6 +4885,14 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 			if (h2s->status < 100 || h2s->status > 999) {
 				TRACE_ERROR("will not encode an invalid status code", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
 				goto fail;
+			}
+
+			/* If an Extended CONNECT has been received, we need to
+			 * convert 101 to 200 */
+			if (unlikely(h2s->flags & H2_SF_EXT_CONNECT_RCVD) &&
+			    h2s->status == 101) {
+				h2s->status = 200;
+				h2s->flags &= ~H2_SF_EXT_CONNECT_RCVD;
 			}
 		}
 		else if (type == HTX_BLK_HDR) {
